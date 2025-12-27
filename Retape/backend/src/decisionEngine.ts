@@ -159,6 +159,28 @@ export class VoicemailDecisionEngine extends EventEmitter {
   private recentFrames: FrameAnalysis[] = [];
   private readonly FRAME_BUFFER_SIZE = 50; // Keep last ~2.5 seconds at 50ms frames
 
+  /**
+   * BEEP TEMPORAL CONSISTENCY TRACKING
+   * 
+   * WHY THIS IS NEEDED:
+   * Speech can momentarily produce energy in the beep frequency range,
+   * especially high-pitched vowels or certain consonants. However, these
+   * are brief (10-30ms) while real beeps are sustained (100-500ms+).
+   * 
+   * STRATEGY:
+   * - Count consecutive frames where beep is detected
+   * - Only confirm beep after MIN_CONSECUTIVE_BEEP_FRAMES consecutive detections
+   * - Reset counter when a non-beep frame is encountered
+   * 
+   * At 50ms per frame:
+   * - 2 frames = 100ms (minimum beep)
+   * - 3 frames = 150ms (confident)
+   * - 4 frames = 200ms (very confident)
+   */
+  private consecutiveBeepFrames: number = 0;
+  private beepStartTimestamp: number | null = null;
+  private readonly MIN_CONSECUTIVE_BEEP_FRAMES = 3; // Require 150ms of sustained beep
+
   constructor(useMock: boolean = false) {
     super();
     this.useMock = useMock;
@@ -201,6 +223,8 @@ export class VoicemailDecisionEngine extends EventEmitter {
     this.finalDecision = null;
     this.streamingStarted = false;
     this.recentFrames = [];
+    this.consecutiveBeepFrames = 0;
+    this.beepStartTimestamp = null;
     console.log('[DecisionEngine] Ready');
   }
 
@@ -262,9 +286,36 @@ export class VoicemailDecisionEngine extends EventEmitter {
     // 
     // Therefore: When beep is detected, we MUST restart from the beep,
     // regardless of any earlier candidate decision.
+    // 
+    // TEMPORAL CONSISTENCY:
+    // We require MIN_CONSECUTIVE_BEEP_FRAMES consecutive frames with beep
+    // to confirm detection. This prevents false positives from speech
+    // harmonics which are brief (10-30ms) compared to real beeps (100-500ms+).
     // =========================================================================
-    if (frameAnalysis.beepDetected && !this.state.beepDetected) {
-      return this.handleBeepDetected(timestamp);
+    if (frameAnalysis.beepDetected) {
+      // Increment consecutive beep counter
+      this.consecutiveBeepFrames++;
+      
+      // Record when the potential beep started
+      if (this.beepStartTimestamp === null) {
+        this.beepStartTimestamp = timestamp;
+        console.log(`[DecisionEngine] 🎵 Potential beep started at ${timestamp.toFixed(3)}s (frame 1/${this.MIN_CONSECUTIVE_BEEP_FRAMES})`);
+      } else {
+        console.log(`[DecisionEngine] 🎵 Beep continues at ${timestamp.toFixed(3)}s (frame ${this.consecutiveBeepFrames}/${this.MIN_CONSECUTIVE_BEEP_FRAMES})`);
+      }
+      
+      // Check if we've seen enough consecutive beep frames
+      if (this.consecutiveBeepFrames >= this.MIN_CONSECUTIVE_BEEP_FRAMES && !this.state.beepDetected) {
+        console.log(`[DecisionEngine] ✅ BEEP CONFIRMED after ${this.consecutiveBeepFrames} consecutive frames`);
+        return this.handleBeepDetected(this.beepStartTimestamp!);
+      }
+    } else {
+      // Not a beep frame - reset the counter
+      if (this.consecutiveBeepFrames > 0) {
+        console.log(`[DecisionEngine] 🔇 Beep interrupted after ${this.consecutiveBeepFrames} frames (needed ${this.MIN_CONSECUTIVE_BEEP_FRAMES})`);
+      }
+      this.consecutiveBeepFrames = 0;
+      this.beepStartTimestamp = null;
     }
 
     // Step 4: Track silence periods

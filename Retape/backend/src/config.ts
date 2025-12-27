@@ -29,10 +29,10 @@ export const config = {
 
   // Beep Detection
   beep: {
-    // Typical voicemail beeps are in the 1000-1400 Hz range
-    // These are single-tone signals designed to be clearly audible
-    minFrequency: parseInt(process.env.BEEP_MIN_FREQ || '1000', 10),
-    maxFrequency: parseInt(process.env.BEEP_MAX_FREQ || '1400', 10),
+    // Voicemail beeps vary widely: 800-2200 Hz range covers most systems
+    // AT&T ~1000Hz, Verizon ~1400-1500Hz, Generic DTMF ~1000-2000Hz
+    minFrequency: parseInt(process.env.BEEP_MIN_FREQ || '800', 10),
+    maxFrequency: parseInt(process.env.BEEP_MAX_FREQ || '2200', 10),
     
     // Energy threshold: the ratio of energy in the beep frequency band
     // to total frame energy. Higher values = stricter detection

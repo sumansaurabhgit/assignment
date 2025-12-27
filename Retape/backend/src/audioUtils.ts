@@ -125,32 +125,54 @@ function padToPowerOfTwo(samples: Float32Array): Float32Array {
 }
 
 /**
- * Detects if a beep is present in the audio frame using FFT analysis.
+ * Advanced Beep Detection with Tone Purity Analysis
  * 
- * BEEP DETECTION STRATEGY:
- * Voicemail beeps are typically single-frequency tones in the 1000-1400 Hz range.
- * They have these characteristics:
- * 1. High energy concentration in a narrow frequency band
- * 2. Sustained for at least 50-200ms
- * 3. Significantly louder than background noise
+ * PROBLEM WITH SIMPLE ENERGY RATIO:
+ * Speech contains harmonics that can concentrate energy in the beep frequency range.
+ * When someone says a number emphatically or speaks in a high pitch, the simple
+ * energy ratio check can trigger false positives.
  * 
- * This function analyzes the frequency spectrum and checks if there's
- * a strong energy spike in the expected beep frequency range.
+ * SOLUTION - MULTI-CRITERIA BEEP DETECTION:
+ * Real voicemail beeps have these characteristics that speech does NOT:
  * 
- * WHY BEEP DETECTION HAS HIGHEST PRIORITY:
- * A beep is an unambiguous signal that the voicemail system is ready
- * for recording. Unlike speech analysis which can be uncertain, a beep
- * is a definitive marker. If we start too early (during silence before
- * the beep), the consumer won't hear the required compliance message.
+ * 1. TONE PURITY (Spectral Flatness):
+ *    - Beeps are pure single-frequency tones with very narrow bandwidth
+ *    - Speech has energy spread across many frequencies (harmonics, formants)
+ *    - We measure "spectral flatness" - beeps have LOW flatness (peaked), speech has HIGH
+ * 
+ * 2. PEAK PROMINENCE:
+ *    - Beeps have ONE dominant peak that stands out significantly
+ *    - Speech has multiple peaks of similar magnitude
+ *    - We check if the peak is much higher than surrounding frequencies
+ * 
+ * 3. FREQUENCY STABILITY:
+ *    - Beeps maintain the same frequency throughout
+ *    - Speech frequencies vary rapidly (formant transitions)
+ *    - This is tracked across frames in the decision engine
+ * 
+ * 4. ENERGY CONCENTRATION:
+ *    - A true beep has >50-70% of its energy in a very narrow band (~50-100 Hz wide)
+ *    - Speech might have 30% in the beep range but spread across the whole range
  * 
  * @param samples - Audio samples
  * @param sampleRate - Sample rate of the audio
- * @returns Object with detection result and band energy
+ * @returns Detailed analysis for beep detection
  */
+export interface BeepAnalysis {
+  detected: boolean;
+  confidence: number;          // 0-1, how confident we are this is a beep
+  bandEnergy: number;          // Energy ratio in beep band
+  totalEnergy: number;         // Total frame energy
+  peakFrequency: number;       // Dominant frequency in Hz
+  tonePurity: number;          // 0-1, how pure/narrow the tone is (1 = pure tone)
+  peakProminence: number;      // How much the peak stands out
+  isLikelySpeech: boolean;     // Heuristic: does this look like speech?
+}
+
 export function detectBeep(
   samples: Float32Array,
   sampleRate: number = config.audio.sampleRate
-): { detected: boolean; bandEnergy: number; totalEnergy: number } {
+): { detected: boolean; bandEnergy: number; totalEnergy: number; analysis?: BeepAnalysis } {
   // Pad to power of 2 for FFT
   const paddedSamples = padToPowerOfTwo(samples);
   const n = paddedSamples.length;
@@ -168,7 +190,7 @@ export function detectBeep(
   // Perform FFT
   fft(real, imag);
 
-  // Calculate magnitude spectrum
+  // Calculate magnitude spectrum (only positive frequencies)
   const magnitudes = new Float32Array(n / 2);
   for (let i = 0; i < n / 2; i++) {
     magnitudes[i] = Math.sqrt(real[i] * real[i] + imag[i] * imag[i]);
@@ -181,13 +203,22 @@ export function detectBeep(
   const minBin = Math.floor(config.beep.minFrequency / freqResolution);
   const maxBin = Math.ceil(config.beep.maxFrequency / freqResolution);
 
-  // Calculate energy in beep band
-  let beepBandEnergy = 0;
+  // =========================================================================
+  // ANALYSIS 1: Find peak in beep frequency range
+  // =========================================================================
   let peakMagnitude = 0;
+  let peakBin = minBin;
+  let beepBandEnergy = 0;
+  
   for (let i = minBin; i <= maxBin && i < magnitudes.length; i++) {
     beepBandEnergy += magnitudes[i] * magnitudes[i];
-    peakMagnitude = Math.max(peakMagnitude, magnitudes[i]);
+    if (magnitudes[i] > peakMagnitude) {
+      peakMagnitude = magnitudes[i];
+      peakBin = i;
+    }
   }
+  
+  const peakFrequency = peakBin * freqResolution;
 
   // Calculate total energy
   let totalEnergy = 0;
@@ -196,25 +227,121 @@ export function detectBeep(
   }
 
   // Avoid division by zero
-  if (totalEnergy === 0) {
+  if (totalEnergy === 0 || peakMagnitude === 0) {
     return { detected: false, bandEnergy: 0, totalEnergy: 0 };
   }
 
-  // Calculate energy ratio
-  const energyRatio = beepBandEnergy / totalEnergy;
+  const bandEnergyRatio = beepBandEnergy / totalEnergy;
 
-  // Detection criteria:
-  // 1. Energy ratio in beep band exceeds threshold
-  // 2. Total energy is above noise floor (not just noise concentrated in one band)
-  const noiseFloor = 0.001; // Minimum energy to consider
-  const detected = 
-    energyRatio > config.beep.energyThreshold && 
-    totalEnergy > noiseFloor;
+  // =========================================================================
+  // ANALYSIS 2: Tone Purity - Check if energy is concentrated in narrow band
+  // =========================================================================
+  // For a pure tone, energy should be concentrated within ~50-100 Hz of peak
+  // We check how much energy is within ±3 bins of the peak vs the whole beep band
+  
+  const narrowBandWidth = 3; // ±3 bins around peak
+  let narrowBandEnergy = 0;
+  for (let i = Math.max(0, peakBin - narrowBandWidth); 
+       i <= Math.min(magnitudes.length - 1, peakBin + narrowBandWidth); i++) {
+    narrowBandEnergy += magnitudes[i] * magnitudes[i];
+  }
+  
+  // Tone purity: ratio of narrow band energy to beep band energy
+  // Pure tone: ~0.8-1.0, Speech: ~0.2-0.5
+  const tonePurity = beepBandEnergy > 0 ? narrowBandEnergy / beepBandEnergy : 0;
+
+  // =========================================================================
+  // ANALYSIS 3: Peak Prominence - How much does the peak stand out?
+  // =========================================================================
+  // Calculate average magnitude in the beep band (excluding peak area)
+  let surroundingSum = 0;
+  let surroundingCount = 0;
+  for (let i = minBin; i <= maxBin && i < magnitudes.length; i++) {
+    if (Math.abs(i - peakBin) > narrowBandWidth) {
+      surroundingSum += magnitudes[i];
+      surroundingCount++;
+    }
+  }
+  const surroundingAvg = surroundingCount > 0 ? surroundingSum / surroundingCount : 0;
+  
+  // Peak prominence: how many times higher is the peak than surrounding?
+  // Beep: typically 5-20x, Speech: typically 1-3x
+  const peakProminence = surroundingAvg > 0 ? peakMagnitude / surroundingAvg : 0;
+
+  // =========================================================================
+  // ANALYSIS 4: Check if peak is actually IN the beep frequency range
+  // =========================================================================
+  // If the dominant peak is outside the beep band, this is likely speech
+  // (speech harmonics at higher frequencies). A real beep has its peak
+  // squarely within the expected beep frequency range.
+  
+  const peakInBeepBand = peakFrequency >= config.beep.minFrequency && 
+                          peakFrequency <= config.beep.maxFrequency;
+
+  // =========================================================================
+  // FINAL DECISION: Combine all criteria
+  // =========================================================================
+  // 
+  // STRICT BEEP CRITERIA (all must be true):
+  // 1. Peak frequency is within beep band (1000-2000 Hz typically)
+  // 2. Sufficient energy in beep band (>35% of total)
+  // 3. High tone purity (>0.5) - pure tone, not spread out
+  // 4. High peak prominence (>4x surrounding) - single dominant frequency
+  // 5. Sufficient overall energy (not just noise)
+  
+  const BEEP_BAND_THRESHOLD = 0.35;     // At least 35% energy in beep band
+  const TONE_PURITY_THRESHOLD = 0.5;    // At least 50% of beep band in narrow peak
+  const PEAK_PROMINENCE_THRESHOLD = 4;  // Peak must be 4x higher than surroundings
+  const NOISE_FLOOR = 0.0005;           // Minimum energy to consider
+  
+  const meetsEnergyRatio = bandEnergyRatio > BEEP_BAND_THRESHOLD;
+  const meetsTonePurity = tonePurity > TONE_PURITY_THRESHOLD;
+  const meetsPeakProminence = peakProminence > PEAK_PROMINENCE_THRESHOLD;
+  const aboveNoiseFloor = totalEnergy > NOISE_FLOOR;
+  
+  const detected = peakInBeepBand &&
+                   meetsEnergyRatio && 
+                   meetsTonePurity && 
+                   meetsPeakProminence && 
+                   aboveNoiseFloor;
+  
+  // Calculate confidence score (0-1)
+  let confidence = 0;
+  if (aboveNoiseFloor && peakInBeepBand) {
+    confidence = (
+      (bandEnergyRatio / BEEP_BAND_THRESHOLD) * 0.3 +
+      (tonePurity / TONE_PURITY_THRESHOLD) * 0.35 +
+      (Math.min(peakProminence, 10) / 10) * 0.35
+    );
+    confidence = Math.min(1, confidence);
+  }
+
+  const analysis: BeepAnalysis = {
+    detected,
+    confidence,
+    bandEnergy: bandEnergyRatio,
+    totalEnergy,
+    peakFrequency,
+    tonePurity,
+    peakProminence,
+    isLikelySpeech: !peakInBeepBand, // Speech if peak is outside beep band
+  };
+
+  // Debug logging for tuning
+  if (bandEnergyRatio > 0.2 || detected) { // Log when there's significant beep-band energy
+    console.log(`[BeepDetect] freq=${peakFrequency.toFixed(0)}Hz, ` +
+                `bandRatio=${bandEnergyRatio.toFixed(3)}, ` +
+                `purity=${tonePurity.toFixed(3)}, ` +
+                `prominence=${peakProminence.toFixed(1)}, ` +
+                `inBand=${peakInBeepBand}, ` +
+                `detected=${detected}`);
+  }
 
   return {
     detected,
-    bandEnergy: energyRatio,
+    bandEnergy: bandEnergyRatio,
     totalEnergy,
+    analysis,
   };
 }
 
